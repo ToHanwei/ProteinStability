@@ -1,12 +1,18 @@
+import argparse
+import datetime
 from argparse import ArgumentParser
-from typing import Tuple, Dict
+from typing import Dict, Tuple
 
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch import Tensor
+# 这里的Proteinbb这个类必须要导入，尽管没有显式调用
+# 否则torch.load的时候pickle的反序列化操作会因为找不到Proteinbb这个class的定义而报错
+from dataset import ProteinDataModule, Proteinbb  
 
 
 class AMPNNLayer(nn.Module):
@@ -18,33 +24,35 @@ class AMPNNLayer(nn.Module):
         n_neighbors = 32, 
     ):
         super().__init__()
-        # message modules
+        # multihead message modules
         self.attn_message = nn.MultiheadAttention(
             embed_dim = embed_dim,
             num_heads = n_heads,
             dropout = dropout,
         )
+        # feed forword message modules
         self.ffn_message = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
             nn.Linear(embed_dim * 4, embed_dim),
         )
-        # update modules
+        # multihead update modules
         self.attn_update = nn.MultiheadAttention(
             embed_dim = embed_dim,
             num_heads = n_heads,
             dropout = dropout,
         )
+        # feed forword update modules
         self.ffn_update = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
             nn.Linear(embed_dim * 4, embed_dim),
         )
-        
+        # linear transition modules
+        # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
         self.message_transition = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim)  
-        )  # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
-        
+        )
         self.layer_norms = nn.ModuleList(
             nn.LayerNorm(embed_dim) 
             for _ in range(4)
@@ -58,7 +66,7 @@ class AMPNNLayer(nn.Module):
                 e_0 (Tensor): The output of embd(edge_feats)
         """
         h_1, _ = self.attn_message(
-            h_1[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),  # central node
+            h_0[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),  # central node
             h_0,
             h_0
         )
@@ -81,7 +89,7 @@ class AMPNN(nn.Module):
         self,
         embed_dim = 128,
         edge_dim = 27,
-        node_dim = 38,
+        node_dim = 28,  # 源码上这个默认参数是38，实际应是28，不过此处的更改不影响最后传参
         n_heads = 8,
         n_layers = 3,
         n_tokens = 33,
@@ -128,6 +136,7 @@ class AMPNN(nn.Module):
 class LiteAMPNN(pl.LightningModule):
     def __init__(
         self,
+        args,
         embed_dim = 128,
         edge_dim = 27,
         node_dim = 28,
@@ -149,24 +158,11 @@ class LiteAMPNN(pl.LightningModule):
             n_neighbors = n_neighbors
         )
         self.lr = lr
+        self.args = args
 
         self.train_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
         self.valid_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
         self.test_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
-    
-    @staticmethod
-    def add_model_specific_args(parent_parser: ArgumentParser):
-        parser = parent_parser.add_argument_group("Liteampnn")
-        
-        parser.add_argument("--embed_dim", type=int, default=128)
-        parser.add_argument("--edge_dim", type=int, default=27)
-        parser.add_argument("--node_dim", type=int, default=28)
-        parser.add_argument("--dropout", type=float, default=0.2)
-        parser.add_argument("--n_layers", type=int, default=3)
-        parser.add_argument("--n_tokens", type=int, default=21)
-        parser.add_argument("--lr", type=float, default=1e-3)
-        
-        return parent_parser
     
     def training_step(self, batch, batch_idx) -> Dict[str, Tensor]:
         node, edge, y = batch
@@ -182,6 +178,7 @@ class LiteAMPNN(pl.LightningModule):
             on_step = True,
             on_epoch = False,
             rank_zero_only = True,
+            batch_size = self.args.train_batch_size,
         )
         self.log(
             'train_acc_step',
@@ -189,6 +186,7 @@ class LiteAMPNN(pl.LightningModule):
             on_step = True,
             on_epoch = False,
             rank_zero_only = True,
+            batch_size = self.args.train_batch_size,
         )
         
         return {'loss': loss}
@@ -208,14 +206,16 @@ class LiteAMPNN(pl.LightningModule):
             on_epoch = True,
             rank_zero_only = True,
             sync_dist = True,
+            batch_size = self.args.valid_batch_size,
         )
         self.log(
             'valid_acc_step',
-            self.train_acc,
+            self.valid_acc,
             on_step = False,
             on_epoch = True,
             rank_zero_only = True,
             sync_dist = True,
+            batch_size = self.args.valid_batch_size,
         )
     
     def test_step(self, batch, batch_idx):
@@ -229,6 +229,7 @@ class LiteAMPNN(pl.LightningModule):
             self.test_acc,
             rank_zero_only = True,
             sync_dist = True,
+            batch_size = self.args.valid_batch_size,
         )
     
     def configure_optimizers(self):
@@ -242,18 +243,71 @@ class LiteAMPNN(pl.LightningModule):
 
 
 if __name__ == '__main__':
-    model = LiteAMPNN()
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    
+    if torch.cuda.is_available():
+        # if the CUDA device is A100 80GB
+        # Set the matrix multiplication precision `high` rather than `highest`
+        cuda_device_name = torch.cuda.get_device_properties(0).name
+        if cuda_device_name == 'NVIDIA A100-SXM4-80GB':
+            torch.set_float32_matmul_precision('high')
+    
+    noise = 0.0
+    n_neighbors = 32
+    
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--edge_dim', type=int, default=27)
+    parser.add_argument('--node_dim', type=int, default=28)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--n_layers', type=int, default=3)
+    parser.add_argument('--n_tokens', type=int, default=21)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    
+    parser.add_argument('--train-batch-size', type=int, default=8)
+    parser.add_argument('--valid-batch-size', type=int, default=32)
+    
+    args = parser.parse_args()
+    
+    model = LiteAMPNN(
+        args,
+        embed_dim = args.embed_dim,
+        edge_dim = args.edge_dim,
+        node_dim = args.node_dim,
+        dropout = args.dropout,
+        n_layers = args.n_layers,
+        n_tokens = args.n_tokens,
+    )
+    
+    logger = TensorBoardLogger(
+        save_dir = './logs/',
+        name = 'pythia_test',
+        version = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S'),
+    )
+    
     trainer = pl.Trainer(
         accelerator = 'gpu',
         devices = 1,
         precision = '16-mixed',
-        max_epochs = 100,
+        max_epochs = 30,
         log_every_n_steps = 1,
         enable_model_summary = True,
+    )
+    
+    data_module = ProteinDataModule(
+        args,
+        data_dir = '/home/hanwei/20230829_protein_thermal_stability/Pythia/s669_AF_PDBs.pt',
+        noise = noise,
+        n_neighbors = n_neighbors,
     )
     
     # start training process
     trainer.fit(
         model = model,
-        datamodule = None,
+        datamodule = data_module,
     )

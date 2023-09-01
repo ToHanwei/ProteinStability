@@ -112,6 +112,7 @@ def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False):
         zero_prot.c[:L, :, :] = protbb.c
         zero_prot.o[:L, :, :] = protbb.o
         zero_prot.n[:L, :, :] = protbb.n
+        
         zero_prot.seq[:L, :] = protbb.seq
         zero_prot.resseq[:L, :] = protbb.resseq
         zero_prot.chain_num[:L, :] = protbb.chain_num

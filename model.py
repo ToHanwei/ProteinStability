@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import os
 from argparse import ArgumentParser
 from typing import Dict, Tuple
 
@@ -8,11 +9,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
-from pytorch_lightning.loggers import TensorBoardLogger
-from torch import Tensor
 # 这里的Proteinbb这个类必须要导入，尽管没有显式调用
 # 否则torch.load的时候pickle的反序列化操作会因为找不到Proteinbb这个class的定义而报错
-from dataset import ProteinDataModule, Proteinbb  
+from dataset import Proteinbb, ProteinDataModule
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch import Tensor
 
 
 class AMPNNLayer(nn.Module):
@@ -89,7 +90,7 @@ class AMPNN(nn.Module):
         self,
         embed_dim = 128,
         edge_dim = 27,
-        node_dim = 28,  # 源码上这个默认参数是38，实际应是28，不过此处的更改不影响最后传参
+        node_dim = 28,  # 源码上这个默认参数是38，实际应是28，我们认为这是作者的小笔误，这里给修改成28
         n_heads = 8,
         n_layers = 3,
         n_tokens = 33,
@@ -242,37 +243,16 @@ class LiteAMPNN(pl.LightningModule):
         return [optimizer]
 
 
-if __name__ == '__main__':
-    torch.cuda.empty_cache()
-    torch.cuda.empty_cache()
-    torch.cuda.empty_cache()
-    torch.cuda.empty_cache()
-    torch.cuda.empty_cache()
-    
+def main(args):
+    for _ in range(5):
+        torch.cuda.empty_cache()
+
     if torch.cuda.is_available():
         # if the CUDA device is A100 80GB
         # Set the matrix multiplication precision `high` rather than `highest`
         cuda_device_name = torch.cuda.get_device_properties(0).name
         if cuda_device_name == 'NVIDIA A100-SXM4-80GB':
             torch.set_float32_matmul_precision('high')
-    
-    noise = 0.0
-    n_neighbors = 32
-    
-    parser = argparse.ArgumentParser()
-    
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--edge_dim', type=int, default=27)
-    parser.add_argument('--node_dim', type=int, default=28)
-    parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--n_layers', type=int, default=3)
-    parser.add_argument('--n_tokens', type=int, default=21)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    
-    parser.add_argument('--train-batch-size', type=int, default=8)
-    parser.add_argument('--valid-batch-size', type=int, default=32)
-    
-    args = parser.parse_args()
     
     model = LiteAMPNN(
         args,
@@ -285,25 +265,30 @@ if __name__ == '__main__':
     )
     
     logger = TensorBoardLogger(
-        save_dir = './logs/',
-        name = 'pythia_test',
-        version = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S'),
+        save_dir = os.getcwd(),
+        name = 'logs',
+        version = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S'),
     )
     
     trainer = pl.Trainer(
         accelerator = 'gpu',
-        devices = 1,
+        devices = [1],
         precision = '16-mixed',
         max_epochs = 30,
+        logger = logger,
         log_every_n_steps = 1,
         enable_model_summary = True,
     )
     
+    # 这里用于训练的数据是处理后的结果，直接导入即可
+    # 第一次训练请先执行：python dataset.py处理数据；
+    # 然后，执行python model.py训练模型
+    processed_data_path = os.path.join(os.getcwd(), 'data', 's669_AF_PDBs.pt')
     data_module = ProteinDataModule(
         args,
-        data_dir = '/home/hanwei/20230829_protein_thermal_stability/Pythia/s669_AF_PDBs.pt',
-        noise = noise,
-        n_neighbors = n_neighbors,
+        processed_data = processed_data_path,
+        noise = 0.0,
+        n_neighbors = args.n_neighbors,
     )
     
     # start training process
@@ -311,3 +296,22 @@ if __name__ == '__main__':
         model = model,
         datamodule = data_module,
     )
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--edge_dim', type=int, default=27)
+    parser.add_argument('--node_dim', type=int, default=28)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--n_layers', type=int, default=3)
+    parser.add_argument('--n_tokens', type=int, default=21)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--n_neighbors', type=int, default=32)
+    parser.add_argument('--train-batch-size', type=int, default=8)
+    parser.add_argument('--valid-batch-size', type=int, default=32)
+    
+    args = parser.parse_args()
+    
+    main(args)

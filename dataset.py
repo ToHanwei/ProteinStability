@@ -3,6 +3,7 @@ import glob
 import gzip
 import os
 import pickle
+import warnings
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -12,8 +13,8 @@ import torch
 import torch.nn.functional as F
 from Bio.PDB import FastMMCIFParser, PDBParser
 from Bio.PDB.Polypeptide import three_to_index
-from Bio.PDB.Structure import Structure
-from joblib import Parallel, delayed
+# from Bio.PDB.Structure import Structure
+# from joblib import Parallel, delayed
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
@@ -87,8 +88,18 @@ def read_pdb(pdb_file: str):
     Returns:
         Proteinbb (Proteinbb): protein backbone dataset
     """
-    ca_list, cb_list, c_list, o_list, n_list = [], [], [], [], []
-    resseq_list, seq_list, chain_id_list, bb_ang_list, sasa_list = [], [], [], [], []
+    # list of side-chain atom
+    cb_list = []
+    # list of backbone atom
+    ca_list, c_list, o_list, n_list = [], [], [], []
+    # list of resudice
+    resseq_list, seq_list = [], []
+    # list of chain identity
+    chain_id_list = []
+    # backbone dihedral angle
+    bb_ang_list = []
+    # solvent accessible surface area
+    sasa_list = []
     
     try:
         if pdb_file.endswith('.pdb'):
@@ -101,8 +112,17 @@ def read_pdb(pdb_file: str):
             with gzip.open(pdb_file, 'rt') as f:
                 parser = PDBParser(QUIET=True)
                 structure = parser.get_structure(None, f)[0]
+        else:
+            extension = os.path.splitext(pdb_file)[-1]
+            warnings.warn(
+                message=f"{extension} format is not supported.",
+                category=None,
+            )
     except:
-        print(pdb_file)
+        warnings.warn(
+                    message=f"Failed to read structure {pdb_file}.",
+                    category=None,
+        )
     
     structure.atom_to_internal_coordinates()
     chain_dict = {}
@@ -116,23 +136,33 @@ def read_pdb(pdb_file: str):
         chain_id = chain_dict[chain.id]
         
         for residue in chain.get_residues():
+            # determine the integrity of the backbone atoms
+            isBBcomplete = all(atom in residue for atom in heavy_atoms)
             # residue.id[0] == ' ' mean "Classical residue"
-            if all(atom in residue for atom in heavy_atoms) and residue.id[0] == ' ':
+            if isBBcomplete and residue.id[0] == ' ':
+                ca = residue['CA'].coord
+                c = residue['C'].coord
+                n = residue['N'].coord
+                o = residue['O'].coord
                 try:
                     cb = residue['CB'].coord
                 except:
                     # Handling Gly situations
-                    b = residue['CA'].coord - residue['N'].coord
-                    c_ = residue['C'].coord - residue['CA'].coord
-                    a = np.cross(b, c_)
+                    m, n = ca - n, c - ca
+                    q = np.cross(m, n)
                     # Virtual CB coordinates
-                    cb = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c_ + residue['CA'].coord
+                    cb = (
+                        -0.58273431 * q
+                        + 0.56802827 * m 
+                        - 0.54067466 * n 
+                        + residue['CA'].coord
+                        )
                 
-                ca_list.append(residue['CA'].coord)
-                o_list.append(residue['O'].coord)
-                c_list.append(residue['C'].coord)
-                n_list.append(residue['N'].coord)
+                ca_list.append(ca)
                 cb_list.append(cb)
+                o_list.append(o)
+                c_list.append(c)
+                n_list.append(n)
                 
                 chain_id_list.append([chain_id])
                 resseq_list.append([residue.full_id[3][1]])
@@ -213,51 +243,86 @@ def get_neighbors(
     assert len(protbb.seq) == len(protbb.chain_id)
     
     # Backbone CA atomic interatomic distance
-    dist = torch.sqrt(torch.sum(
-        protbb.ca - protbb.ca.reshape(1, n_res, 3) ** 2,
-        dim = -1,
-    ))  # Pytorch broadcasting mechanism
-    _, indices = torch.topk(dist, n_neighbors, largest=False)
-    rel_pos = torch.clamp((protbb.resseq.T - protbb.resseq), min=-32, max=32)  # (NUM_RES, NUM_RES)
-    rel_chains = (protbb.chain_id.T - protbb.chain_id).bool()  # (NUM_RES, NUM_RES)
-    rel_chains = (~rel_chains).int()
+    # ca_dist = torch.sqrt(torch.sum(
+    #     input=protbb.ca - protbb.ca.reshape(1, n_res, 3) ** 2,
+    #     dim=-1,
+    # ))  # Pytorch broadcasting mechanism
     
-    pos = torch.gather(rel_pos, dim=1, index=indices)  # (NUM_RES, NUM_NEIGHBORS)
-    chain_id = torch.gather(rel_chains, dim=1, index=indices)
-    seq_tokens = torch.gather(protbb.seq.T.repeat(n_res, 1), dim=1, index=indices)  # (NUM_RES, NUM_NEIGHBORS)
+    # Backbone CA atomic interatomic distance
+    ca_dist = torch.cdist(
+        x1=protbb.ca.squeeze(1), 
+        x2=protbb.ca.squeeze(1), 
+        p=2
+    )
+    # index of the neighbor residue
+    _, indices=torch.topk(
+        input=ca_dist, 
+        k=n_neighbors, 
+        largest=False
+    )
+    rel_pos = torch.clamp(
+        input=(protbb.resseq.T - protbb.resseq), 
+        min=-32, 
+        max=32
+    )  # (NUM_RES, NUM_RES)
+    # (NUM_RES, NUM_RES)
+    rel_chains = (protbb.chain_id.T - protbb.chain_id).bool()
+    rel_chains = (~rel_chains).int() # (NUM_RES, NUM_RES)
+    
+    # 在蛋白序列上相对于中心残基的偏移量
+    pos = torch.gather(
+        input=rel_pos, 
+        dim=1, 
+        index=indices
+    )  # (NUM_RES, NUM_NEIGHBORS)
+    # chain identity
+    chain_id = torch.gather(
+        input=rel_chains, 
+        dim=1, 
+        index=indices
+    )  # (NUM_RES, NUM_NEIGHBORS)
+    # amino acid type torken
+    seq_tokens = torch.gather(
+        input=protbb.seq.T.repeat(n_res, 1),
+        dim=1, 
+        index=indices
+    )  # (NUM_RES, NUM_NEIGHBORS)
     
     if train:
         mask_prob = torch.rand(n_res)
+        # 中心残基85%概率被MASK，15%概率被突变
         seq_tokens[:, 0] = torch.tensor([21] * n_res) * (mask_prob < 0.85).int() + \
                            torch.randint(0, 20, (n_res, )) * (mask_prob >= 0.85).int()
     else:
-        seq_tokens[:, 0] = 21  # mask all for inference
+        # mask all for inference
+        seq_tokens[:, 0] = 21
     
     bb_ang = torch.gather(
-        protbb.bb_ang[:, None, ...].repeat(1, n_res, 1),
-        dim = 1,
-        index = indices[..., None].repeat(1, 1, 6),
+        input=protbb.bb_ang[:, None, ...].repeat(1, n_res, 1),
+        dim=1,
+        index=indices[..., None].repeat(1, 1, 6),
     )  # (NUM_RES, NUM_NEIGHBORS, 6)
-    bb_coords = torch.cat([
-        protbb.ca, protbb.cb, protbb.c, protbb.n, protbb.o
-    ], dim = -2)  # (NUM_RES, 5, 3)
+    bb_coords = torch.cat(
+        tensors=[protbb.ca, protbb.cb, protbb.c, protbb.n, protbb.o],
+        dim = -2
+    )  # (NUM_RES, 5, 3)
     
     if noise_level > 0:
-        bb_coords += torch.rand_like(bb_coords) * noise_level  # noise disturbance
+        # noise disturbance
+        bb_coords += torch.rand_like(bb_coords) * noise_level  
     
     dist_x = bb_coords[None, :, None, ...] - bb_coords[:, None, :, None, ...]  # (NUM_RES, NUM_RES, 5, 5, 3)
     dist = torch.sqrt(torch.sum(dist_x ** 2, dim=-1)).reshape(n_res, n_res, 25)  # (NUM_RES, NUM_RES, 5, 5) -> (NUM_RES, NUM_RES, 25)
     dist = torch.gather(dist, dim=1, index=indices[..., None].repeat(1, 1, 25))  # (NUM_RES, NUM_NEIGHBORS, 25)
     
-    nodes = torch.cat([
-        F.one_hot(seq_tokens.long(), num_classes=22),
-        bb_ang
-    ], dim = -1).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 22 + 6)
-    edge = torch.cat([
-        dist,
-        pos[..., None],
-        chain_id[..., None],
-    ], dim = -1).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 25 + 1 + 1)
+    nodes = torch.cat(
+        tensors=[F.one_hot(seq_tokens.long(), num_classes=22), bb_ang], 
+        dim = -1
+    ).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 22 + 6)
+    edge = torch.cat(
+        tensors=[dist, pos[..., None], chain_id[..., None],], 
+        dim = -1
+    ).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 25 + 1 + 1)
     
     return nodes, edge, protbb.seq.squeeze(-1).long()
 
@@ -266,69 +331,21 @@ def parallel_converter(pdb: str) -> Proteinbb:
     return read_pdb(pdb_file=pdb)
 
 
-def save_all(all_pdbs: List[str]) -> None:
-    # all_protbb = Parallel(n_jobs=-5)(
-    #     delayed(parallel_converter)(pdb)
-    #     for pdb in tqdm(all_pdbs)
-    # )
+def Process_stru_dir(all_pdbs: List[str]) -> None:
+    """Process structure directories iteratively
+
+    Args:
+        all_pdbs (List[str]): list of protein structural pathways
+
+    Returns:
+        all_protbb (List[Proteinbb]): list of protein backbone dataset
+    """
     all_protbb = []
     
     for pdb in tqdm(all_pdbs):
         all_protbb.append(read_pdb(pdb))
     
     return all_protbb
-    
-    # for pdb, protbb in zip(all_pdbs, all_protbb):
-    #     with open(os.path.join('./data', f'{pdb}.pkl'), 'wb') as f:
-    #         pickle.dump(protbb, f)
-
-
-class ProteinDataset(Dataset):
-    def __init__(
-        self,
-        # data: List[List[Tensor, Tensor, torch.LongTensor]],
-        protbbs: List[Proteinbb],
-        # meta_batch_size = 2000,
-        noise = 0.0,
-        n_neighbors = 32,
-    ):
-        super().__init__()
-        
-        self.protbbs = protbbs
-        self.noise = noise
-        self.n_neighbors = n_neighbors
-        
-        # self.data = data
-        
-    def __getitem__(self, idx) -> Tuple[Tensor, Tensor, torch.LongTensor]:
-        # batch = self.protbbs[idx]
-        # nodes, edges, targets = [], [], []
-        
-        # for protbb in batch:
-        #     node, edge, target = get_neighbors(
-        #         protbb,
-        #         n_neighbors = self.n_neighbors,
-        #         noise_level = self.noise,
-        #     )
-        #     map(lambda l, elem: l.append(elem), [nodes, edges, targets], [node, edge, target])
-            
-        # return (
-        #     torch.cat(nodes, dim=1),
-        #     torch.cat(edges, dim=1),
-        #     torch.cat(targets).long(),
-        # )
-        protbb = self.protbbs[idx]
-        
-        node, edge, target = get_neighbors(
-            protbb,
-            n_neighbors = self.n_neighbors,
-            noise_level = self.noise,
-        )
-        
-        return node, edge, target
-    
-    def __len__(self):
-        return len(self.protbbs)
 
 
 def collat_fn(batch):
@@ -346,26 +363,59 @@ def collat_fn(batch):
     
     return nodes, edges, targets
 
-            
-class ProteinDataModule(pl.LightningDataModule):
+
+class ProteinDataset(Dataset):
     def __init__(
         self,
-        args,
-        data_dir: str,
+        # data: List[List[Tensor, Tensor, torch.LongTensor]],
+        protbbs: List[Proteinbb],
         noise = 0.0,
         n_neighbors = 32,
     ):
         super().__init__()
         
-        self.data_dir = data_dir
-        self.args = args
+        self.protbbs = protbbs
+        self.noise = noise
+        self.n_neighbors = n_neighbors
         
+        # self.data = data
+        
+    def __getitem__(self, idx) -> Tuple[Tensor, Tensor, torch.LongTensor]:
+        protbb = self.protbbs[idx]
+        
+        node, edge, target = get_neighbors(
+            protbb,
+            n_neighbors = self.n_neighbors,
+            noise_level = self.noise,
+        )
+        
+        return node, edge, target
+    
+    def __len__(self):
+        return len(self.protbbs)
+
+        
+class ProteinDataModule(pl.LightningDataModule):
+    """protein data precess modele
+
+    Args:
+        pl : _description_
+    """
+    def __init__(
+        self,
+        args,
+        processed_data: str,
+        noise = 0.0,
+        n_neighbors = 32,
+    ):
+        super().__init__()
+        self.processed_data = processed_data
+        self.args = args
         self.n_neighbors = n_neighbors
         self.noise = noise
     
     def setup(self, stage: Optional[str] = None) -> None:
-        print(self.data_dir)
-        self.data = torch.load(self.data_dir, map_location='cpu')
+        self.data = torch.load(self.processed_data, map_location='cpu')
         
         dataset = ProteinDataset(
             self.data,
@@ -374,7 +424,7 @@ class ProteinDataModule(pl.LightningDataModule):
         )
         
         self.train_set, self.val_set, self.test_set = random_split(
-            dataset, 
+            dataset,
             lengths = [0.7, 0.2, 0.1],
         )
     
@@ -405,20 +455,20 @@ class ProteinDataModule(pl.LightningDataModule):
 
 
 if __name__ == '__main__':
-    # data_dir = '../Pythia_note/s669_AF_PDBs/'
+    stru_dir = os.path.join(os.getcwd(), 'data', 's669_AF_PDBs')
+    pdb_filenames = os.listdir(stru_dir)
+    pdb_filenames = [os.path.join(stru_dir, f) for f in pdb_filenames]
+    all_protbb = Process_stru_dir(pdb_filenames)
+    processed_path = os.path.join(os.getcwd(), 'data', 's669_AF_PDBs.pt')
+    torch.save(all_protbb, processed_path)
     
-    # pdb_filenames = glob.glob(data_dir + '*.pdb')
-    # all_protbb = save_all(pdb_filenames)
-    # torch.save(all_protbb, 's669_AF_PDBs.pt')
+    # data = []
+    # all_protbb = torch.load('s669_AF_PDBs.pt')
     
-    data = []
-    all_protbb = torch.load('s669_AF_PDBs.pt')
-    print(type(all_protbb[0]))
+    # for protbb in tqdm(all_protbb):
+    #     node, edge, target = get_neighbors(protbb, train=True)
+    #     data.append([node, edge, target])
     
-    for protbb in tqdm(all_protbb):
-        node, edge, target = get_neighbors(protbb, train=True)
-        data.append([node, edge, target])
-    
-    torch.save(data, 'processed_data.pt')
+    # torch.save(data, 'processed_data.pt')
 
     

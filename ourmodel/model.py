@@ -163,7 +163,7 @@ class CollectModel(nn.Module):
             embed_dim = embed_dim, 
             n_heads = n_heads, 
             dropout = dropout, 
-            n_neighbors = self.n_neighbors,
+            n_neighbors = n_neighbors,
         )
         
         self.lm_heads = nn.Linear(embed_dim, n_tokens)
@@ -327,7 +327,7 @@ def main(args):
     
     trainer = pl.Trainer(
         accelerator = 'gpu',
-        devices = [1],
+        devices = 2,
         precision = '16-mixed',
         max_epochs = 1,
         logger = logger,

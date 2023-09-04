@@ -16,149 +16,176 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import Tensor
 
 
-class AMPNNLayer(nn.Module):
+class AttentionBlock(nn.Module):
     def __init__(
         self,
         embed_dim = 128,
         n_heads = 8,
         dropout = 0.2,
-        n_neighbors = 32, 
+        n_neighbors = 32,
     ):
         super().__init__()
-        # multihead message modules
-        self.attn_message = nn.MultiheadAttention(
+        # multihead layer
+        self.multi_attn_layer = nn.MultiheadAttention(
             embed_dim = embed_dim,
             num_heads = n_heads,
             dropout = dropout,
         )
-        # feed forword message modules
-        self.ffn_message = nn.Sequential(
+        # feed forword layer
+        self.ffn_layer = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
             nn.Linear(embed_dim * 4, embed_dim),
         )
-        # multihead update modules
-        self.attn_update = nn.MultiheadAttention(
-            embed_dim = embed_dim,
-            num_heads = n_heads,
-            dropout = dropout,
-        )
-        # feed forword update modules
-        self.ffn_update = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Linear(embed_dim * 4, embed_dim),
-        )
-        # linear transition modules
-        # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
-        self.message_transition = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim)  
-        )
+        # layerNorm layer
         self.layer_norms = nn.ModuleList(
             nn.LayerNorm(embed_dim) 
-            for _ in range(4)
+            for _ in range(2)
         )
-        
         self.n_neighbors = n_neighbors
         
-    # def attention_block(self):
+    def forward(self, x_0: Tensor) -> Tensor:
         
-        
-    def forward(self, h_0: Tensor, e_0: Tensor) -> Tensor:
-        """
-            Args:
-                h_0 (Tensor): The output of embd(node_feats)
-                e_0 (Tensor): The output of embd(edge_feats)
-        """
-        print('h_0:', h_0.shape)
-        h_1, _ = self.attn_message(
-            h_0[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),  # central node
-            h_0,
-            h_0
+        x_1, _ = self.multi_attn_layer(
+            x_0[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),
+            x_0,
+            x_0
         )
-        print('h_1:', h_1.shape)
-        h_2 = self.layer_norms[0](h_0 + h_1)
-        print('h_2:', h_2.shape)
-        h_3 = self.ffn_message(h_2)
-        print('h_3:', h_3.shape)
-        h_4 = self.layer_norms[1](h_3 + h_2)
-        print('h_4:', h_4.shape)
+        x_2 = self.layer_norms[0](x_1 + x_0)
+        x_3 = self.ffn_layer(x_2)
+        x_4 = self.layer_norms[1](x_3 + x_2)
         
-        print('e_0', e_0.shape)
-        e_1, _ = self.attn_message(
-            e_0[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),  # central node
-            e_0,
-            e_0
-        )
-        print('e_1:', e_1.shape)
-        e_2 = self.layer_norms[0](e_0 + e_1)
-        print('e_2:', e_2.shape)
-        e_3 = self.ffn_message(e_2)
-        print('e_3:', e_3.shape)
-        e_4 = self.layer_norms[1](e_3 + e_2)
-        print('e_4:', e_4.shape)
-        # concat & transition
-        mess_t = self.message_transition(
-            torch.cat([h_4, e_4], dim=-1)
-        ) 
-        
-        h_5, _ = self.attn_update(mess_t, h_4, h_4)
-        h_5 = self.ffn_update(self.layer_norms[2](h_5))
-        h_6 = self.layer_norms[3](h_5 + h_4)
-        
-        return h_6
+        return x_4
 
 
-class AMPNN(nn.Module): 
+class AmpnnBlock(nn.Module): 
     def __init__(
         self,
         embed_dim = 128,
         edge_dim = 27,
-        node_dim = 28,  # 源码上这个默认参数是38，实际应是28，我们认为这是作者的小笔误，这里给修改成28
+        node_dim = 28,
         n_heads = 8,
-        n_layers = 3,
-        n_tokens = 33,
+        n_layers = 6,
         dropout = 0.2,
         n_neighbors = 32
-    ):  
+    ):
         super().__init__()
         # basic attributes
         self.embed_dim = embed_dim
         self.edge_dim = edge_dim
         self.node_dim = node_dim
         self.n_layers = n_layers
-        self.n_tokens = n_tokens
         self.dropout = dropout
         self.n_neighbors = n_neighbors
-        # parameters
-        self.init_node_embed = nn.Linear(node_dim, embed_dim, bias=False)
-        self.init_edge_embed = nn.Linear(edge_dim, embed_dim, bias=False)
-        self.layers = nn.ModuleList([
-            AMPNNLayer(
+        # # linear layer for node
+        # self.init_node_embed = nn.Linear(node_dim, embed_dim, bias=False)
+        # # linear layer for edge
+        # self.init_edge_embed = nn.Linear(edge_dim, embed_dim, bias=False)
+
+        # node attention layers
+        self.node_attn_layers = nn.ModuleList([
+            AttentionBlock(
                 embed_dim = embed_dim, 
                 n_heads = n_heads, 
                 dropout = dropout, 
                 n_neighbors = self.n_neighbors,
             ) for _ in range(n_layers)
         ])
-        self.lm_heads = nn.Linear(embed_dim, n_tokens)
-        self.layer_norms = nn.LayerNorm(embed_dim)
+        # edge attention layers
+        self.edge_attn_layers = nn.ModuleList([
+            AttentionBlock(
+                embed_dim = embed_dim, 
+                n_heads = n_heads, 
+                dropout = dropout, 
+                n_neighbors = self.n_neighbors,
+            ) for _ in range(n_layers)
+        ])
+        
+        # linear layer for cat(node, edge)
+        # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
+        self.cat_layer_embed = nn.Linear(embed_dim * 2, embed_dim)
     
     def forward(
         self, 
-        node_feats: Tensor, 
+        h_0: Tensor, 
+        e_0: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        # # node features embedding
+        # h_0 = self.init_node_embed(node_feats)
+        # # edge features embedding
+        # e_0 = self.init_edge_embed(edge_feats)
+        
+        for node_attn_layer in self.node_attn_layers:
+            h_0 = node_attn_layer(h_0)
+        
+        for edge_attn_layer in self.edge_attn_layers:
+            e_0 = edge_attn_layer(e_0)
+        
+        # cat node&edge features
+        c_0 = self.cat_layer_embed(
+            torch.cat([h_0, e_0], dim=-1)
+        ) 
+        
+        return h_0, c_0
+
+
+class CollectModel(nn.Module):
+    def __init__(
+        self,
+        embed_dim = 128,
+        edge_dim = 27,
+        node_dim = 28,
+        dropout = 0.2,
+        n_layers = 6,
+        n_tokens = 21,
+        n_neighbors = 32,
+        n_heads = 8,
+    ):
+        super().__init__()
+        # linear layer for node
+        self.init_node_embed = nn.Linear(node_dim, embed_dim, bias=False)
+        # linear layer for edge
+        self.init_edge_embed = nn.Linear(edge_dim, embed_dim, bias=False)
+        # ampnn layers
+        self.ampnns = nn.ModuleList(
+            AmpnnBlock(
+                embed_dim = embed_dim,
+                edge_dim = edge_dim,
+                node_dim = node_dim,
+                n_layers = n_layers,
+                dropout = dropout,
+                n_neighbors = n_neighbors
+            ) for _ in range(n_layers)
+        )
+        
+        # attention layer
+        self.attn_layer = AttentionBlock(
+            embed_dim = embed_dim, 
+            n_heads = n_heads, 
+            dropout = dropout, 
+            n_neighbors = self.n_neighbors,
+        )
+        
+        self.lm_heads = nn.Linear(embed_dim, n_tokens)
+        
+    def forward(
+        self, 
+        node_feats: Tensor,
         edge_feats: Tensor
     ) -> Tuple[Tensor, Tensor]:
+        # node features embedding
         h_0 = self.init_node_embed(node_feats)
+        # edge features embedding
         e_0 = self.init_edge_embed(edge_feats)
+        for ampnn in self.ampnns:
+            h_0, e_0 = ampnn(h_0, e_0)
         
-        for layer in self.layers:
-            h_0 = layer(h_0, e_0)
+        out = self.attn_layer(e_0)
+        out = self.lm_heads(out.sum(dim=0))
         
-        return self.lm_heads(h_0.sum(dim=0)), h_0
+        return out
 
-
-class LiteAMPNN(pl.LightningModule):
+class LiteModel(pl.LightningModule):
     def __init__(
         self,
         args,
@@ -166,33 +193,35 @@ class LiteAMPNN(pl.LightningModule):
         edge_dim = 27,
         node_dim = 28,
         dropout = 0.2,
-        n_layers = 3,
+        n_layers = 6,
         n_tokens = 21,
-        lr = 1e-3,
         n_neighbors = 32,
+        lr = 1e-3,
     ):
         super().__init__()
-        
-        self.ampnn = AMPNN(
-            embed_dim = embed_dim,
-            edge_dim = edge_dim,
-            node_dim = node_dim,
-            n_tokens = n_tokens,
-            n_layers = n_layers,
-            dropout = dropout,
-            n_neighbors = n_neighbors
-        )
         self.lr = lr
         self.args = args
 
         self.train_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
         self.valid_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
         self.test_acc = torchmetrics.Accuracy(task='multiclass', num_classes=21, top_k=1)
+        
+        # ampnn layers
+        self.collec_model = CollectModel(
+            embed_dim = embed_dim,
+            edge_dim = edge_dim,
+            node_dim = node_dim,
+            dropout = dropout,
+            n_layers = n_layers,
+            n_tokens = n_tokens,
+            n_neighbors = n_neighbors,
+            n_heads = 8,
+        )
     
     def training_step(self, batch, batch_idx) -> Dict[str, Tensor]:
         node, edge, y = batch
         
-        y_hat, _ = self.ampnn(node, edge)
+        y_hat = self.collec_model(node, edge)
         # compute loss
         loss = F.cross_entropy(y_hat, y.squeeze(0))
         
@@ -219,7 +248,7 @@ class LiteAMPNN(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         node, edge, y = batch
         
-        y_hat, _ = self.ampnn(node, edge)
+        y_hat = self.collec_model(node, edge)
         # compute loss
         loss = F.cross_entropy(y_hat, y.squeeze(0))
         
@@ -246,7 +275,7 @@ class LiteAMPNN(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         node, edge, y = batch
         
-        y_hat, _ = self.ampnn(node, edge)
+        y_hat = self.collec_model(node, edge)
         
         self.test_acc(y_hat, y.squeeze(0))
         self.log(
@@ -278,7 +307,7 @@ def main(args):
         if cuda_device_name == 'NVIDIA A100-SXM4-80GB':
             torch.set_float32_matmul_precision('high')
     
-    model = LiteAMPNN(
+    model = LiteModel(
         args,
         embed_dim = args.embed_dim,
         edge_dim = args.edge_dim,
@@ -286,6 +315,8 @@ def main(args):
         dropout = args.dropout,
         n_layers = args.n_layers,
         n_tokens = args.n_tokens,
+        n_neighbors = args.n_neighbors,
+        lr = args.lr,
     )
     
     logger = TensorBoardLogger(
@@ -329,7 +360,7 @@ if __name__ == '__main__':
     parser.add_argument('--edge_dim', type=int, default=27)
     parser.add_argument('--node_dim', type=int, default=28)
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--n_layers', type=int, default=3)
+    parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--n_tokens', type=int, default=21)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--n_neighbors', type=int, default=32)

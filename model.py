@@ -52,7 +52,7 @@ class AMPNNLayer(nn.Module):
         # linear transition modules
         # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
         self.message_transition = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim)  
+            nn.Linear(embed_dim * 2, embed_dim)
         )
         self.layer_norms = nn.ModuleList(
             nn.LayerNorm(embed_dim) 
@@ -76,7 +76,7 @@ class AMPNNLayer(nn.Module):
         # concat & transition
         mess_t = self.message_transition(
             torch.cat([h_2, e_0], dim=-1)
-        ) 
+        )
         
         h_3, _ = self.attn_update(mess_t, h_2, h_2)
         h_3 = self.ffn_update(self.layer_norms[2](h_3))

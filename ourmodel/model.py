@@ -111,7 +111,7 @@ class AmpnnBlock(nn.Module):
             torch.cat([h, e], dim=-1)
         )
         
-        return m, h
+        return m, h, h
 
 
 class CollectModel(nn.Module):
@@ -165,7 +165,7 @@ class CollectModel(nn.Module):
         x, y = h, e
         for ampnn in self.ampnns:
             # y already does not mean edge
-            x, y = ampnn(x, y)
+            x, y, _ = ampnn(x, y)
         
         y_1 = self.attn_layer(y)
         y_2 = self.lm_heads(y_1.sum(dim=0))

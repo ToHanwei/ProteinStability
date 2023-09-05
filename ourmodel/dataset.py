@@ -81,27 +81,16 @@ def init_empty_protein(n_res: int = 32):
 
 
 def read_pdb(pdb_file: str):
-    """get data from PDB file
+    """read PDB format data
 
     Args:
-        pdb_file (str): input file path (pdb, cif or pdb.gz format)
+        pdb_file (str): input file path (pdb, cif or pdb.gz format).
 
     Returns:
-        Proteinbb (Proteinbb): protein backbone dataset
+        structure : protein structure object.
     """
-    # list of side-chain atom
-    cb_list = []
-    # list of backbone atom
-    ca_list, c_list, o_list, n_list = [], [], [], []
-    # list of resudice
-    resseq_list, seq_list = [], []
-    # list of chain identity
-    chain_id_list = []
-    # backbone dihedral angle
-    bb_ang_list = []
-    # solvent accessible surface area
-    sasa_list = []
     
+    structure = None
     try:
         if pdb_file.endswith('.pdb'):
             parser = PDBParser(QUIET=True)
@@ -124,72 +113,99 @@ def read_pdb(pdb_file: str):
                     message=f"Failed to read structure {pdb_file}.",
                     category=None,
         )
+    return structure
+
+
+def calculator(pdb_file: str):
+    """get data from PDB file
+
+    Args:
+        pdb_file (str): input file path (pdb, cif or pdb.gz format)
+
+    Returns:
+        Proteinbb (Proteinbb): protein backbone dataset
+    """
     
-    structure.atom_to_internal_coordinates()
-    chain_dict = {}
-    # backbone heavy atoms
-    heavy_atoms = ['C', 'N', 'O', 'CA']
+    # list of side-chain atom
+    cb_list = []
+    # list of backbone atom
+    ca_list, c_list, o_list, n_list = [], [], [], []
+    # list of resudice
+    resseq_list, seq_list = [], []
+    # list of chain identity
+    chain_id_list = []
+    # backbone dihedral angle
+    bb_ang_list = []
+    # solvent accessible surface area
+    sasa_list = []
     
-    for chain in structure.get_chains():
-        if chain.id not in chain_dict:
-            chain_dict[chain.id] = len(chain_dict)
-        # structure chain index
-        chain_id = chain_dict[chain.id]
+    structure = read_pdb(pdb_file)
+    if structure:
+        structure.atom_to_internal_coordinates()
+        chain_dict = {}
+        # backbone heavy atoms
+        heavy_atoms = ['C', 'N', 'O', 'CA']
         
-        for residue in chain.get_residues():
-            # determine the integrity of the backbone atoms
-            isBBcomplete = all(atom in residue for atom in heavy_atoms)
-            # residue.id[0] == ' ' mean "Classical residue"
-            if isBBcomplete and residue.id[0] == ' ':
-                ca = residue['CA'].coord
-                c = residue['C'].coord
-                n = residue['N'].coord
-                o = residue['O'].coord
-                try:
-                    cb = residue['CB'].coord
-                except:
-                    # Handling Gly situations
-                    m, n = ca - n, c - ca
-                    q = np.cross(m, n)
-                    # Virtual CB coordinates
-                    cb = (
-                        -0.58273431 * q
-                        + 0.56802827 * m 
-                        - 0.54067466 * n 
-                        + residue['CA'].coord
-                        )
-                
-                ca_list.append(ca)
-                cb_list.append(cb)
-                o_list.append(o)
-                c_list.append(c)
-                n_list.append(n)
-                
-                chain_id_list.append([chain_id])
-                resseq_list.append([residue.full_id[3][1]])
-                
-                try:
-                    # residue to index
-                    token_id = three_to_index(residue.get_resname())
-                except:
-                    # uncanonical amino acid
-                    token_id = 20
-                seq_list.append([token_id])
-                
-                # Get the backbone dihedral angle
-                ric = residue.internal_coord
-                phi = ric.get_angle('phi')
-                psi = ric.get_angle('psi')
-                omg = ric.get_angle('omg')
-                
-                phi = 0 if phi == None else phi
-                psi = 0 if psi == None else psi
-                omg = 0 if omg == None else omg
-                
-                bb_ang_list.append(np.concatenate([
-                    np.sin(np.deg2rad([phi, psi, omg])),
-                    np.cos(np.deg2rad([phi, psi, omg])),
-                ]))
+        for chain in structure.get_chains():
+            if chain.id not in chain_dict:
+                chain_dict[chain.id] = len(chain_dict)
+            # structure chain index
+            chain_id = chain_dict[chain.id]
+            
+            for residue in chain.get_residues():
+                # determine the integrity of the backbone atoms
+                isBBcomplete = all(atom in residue for atom in heavy_atoms)
+                # residue.id[0] == ' ' mean "Classical residue"
+                if isBBcomplete and residue.id[0] == ' ':
+                    ca = residue['CA'].coord
+                    c = residue['C'].coord
+                    n = residue['N'].coord
+                    o = residue['O'].coord
+                    try:
+                        cb = residue['CB'].coord
+                    except:
+                        # Handling Gly situations
+                        m, n = ca - n, c - ca
+                        q = np.cross(m, n)
+                        # Virtual CB coordinates
+                        cb = (
+                            -0.58273431 * q
+                            + 0.56802827 * m 
+                            - 0.54067466 * n 
+                            + residue['CA'].coord
+                            )
+                    
+                    ca_list.append(ca)
+                    cb_list.append(cb)
+                    o_list.append(o)
+                    c_list.append(c)
+                    n_list.append(n)
+                    
+                    chain_id_list.append([chain_id])
+                    resseq_list.append([residue.full_id[3][1]])
+                    
+                    try:
+                        # residue to index
+                        token_id = three_to_index(residue.get_resname())
+                    except:
+                        # uncanonical amino acid
+                        token_id = 20
+                    seq_list.append([token_id])
+                    
+                    # Get the backbone dihedral angle
+                    ric = residue.internal_coord
+                    phi = ric.get_angle('phi')
+                    psi = ric.get_angle('psi')
+                    omg = ric.get_angle('omg')
+                    
+                    phi = 0 if phi == None else phi
+                    psi = 0 if psi == None else psi
+                    omg = 0 if omg == None else omg
+                    
+                    bb_ang_list.append(np.concatenate([
+                        np.sin(np.deg2rad([phi, psi, omg])),
+                        np.cos(np.deg2rad([phi, psi, omg])),
+                    ]))
     
     return Proteinbb(
         ca = ca_list, 
@@ -329,7 +345,7 @@ def get_neighbors(
 
 
 def parallel_converter(pdb: str) -> Proteinbb:
-    return read_pdb(pdb_file=pdb)
+    return calculator(pdb_file=pdb)
 
 
 def Process_stru_dir(all_pdbs: List[str]) -> None:
@@ -344,7 +360,7 @@ def Process_stru_dir(all_pdbs: List[str]) -> None:
     all_protbb = []
     
     for pdb in tqdm(all_pdbs):
-        all_protbb.append(read_pdb(pdb))
+        all_protbb.append(calculator(pdb))
     
     return all_protbb
 

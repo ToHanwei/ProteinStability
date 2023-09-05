@@ -44,13 +44,9 @@ class AttentionBlock(nn.Module):
         )
         self.n_neighbors = n_neighbors
         
-    def forward(self, x_0: Tensor) -> Tensor:
-        
-        x_1, _ = self.multi_attn_layer(
-            x_0[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1),
-            x_0,
-            x_0
-        )
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        x_0 = v
+        x_1, _ = self.multi_attn_layer(q, k, v)
         x_2 = self.layer_norms[0](x_1 + x_0)
         x_3 = self.ffn_layer(x_2)
         x_4 = self.layer_norms[1](x_3 + x_2)
@@ -62,33 +58,19 @@ class AmpnnBlock(nn.Module):
     def __init__(
         self,
         embed_dim = 128,
-        edge_dim = 27,
-        node_dim = 28,
         n_heads = 8,
         n_layers = 6,
         dropout = 0.2,
         n_neighbors = 32
     ):
         super().__init__()
-        # basic attributes
-        self.embed_dim = embed_dim
-        self.edge_dim = edge_dim
-        self.node_dim = node_dim
-        self.n_layers = n_layers
-        self.dropout = dropout
-        self.n_neighbors = n_neighbors
-        # # linear layer for node
-        # self.init_node_embed = nn.Linear(node_dim, embed_dim, bias=False)
-        # # linear layer for edge
-        # self.init_edge_embed = nn.Linear(edge_dim, embed_dim, bias=False)
-
         # node attention layers
         self.node_attn_layers = nn.ModuleList([
             AttentionBlock(
                 embed_dim = embed_dim, 
                 n_heads = n_heads, 
                 dropout = dropout, 
-                n_neighbors = self.n_neighbors,
+                n_neighbors = n_neighbors,
             ) for _ in range(n_layers)
         ])
         # edge attention layers
@@ -97,36 +79,39 @@ class AmpnnBlock(nn.Module):
                 embed_dim = embed_dim, 
                 n_heads = n_heads, 
                 dropout = dropout, 
-                n_neighbors = self.n_neighbors,
+                n_neighbors = n_neighbors,
             ) for _ in range(n_layers)
         ])
         
         # linear layer for cat(node, edge)
-        # Concat(node_feats, edge_feats), so input dim is embed_dim * 2
+        # Concat(node_ebedding, edge_ebedding), so input dim is embed_dim * 2
         self.cat_layer_embed = nn.Linear(embed_dim * 2, embed_dim)
+
+        self.n_neighbors = n_neighbors
     
     def forward(
         self, 
-        h_0: Tensor, 
-        e_0: Tensor
+        h: Tensor, 
+        e: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        # # node features embedding
-        # h_0 = self.init_node_embed(node_feats)
-        # # edge features embedding
-        # e_0 = self.init_edge_embed(edge_feats)
-        
+        # Node embedding are processed by AttentionBlocks
         for node_attn_layer in self.node_attn_layers:
-            h_0 = node_attn_layer(h_0)
-        
+            # repeat the embedding of the central atom
+            q_h = h[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1)
+            k_h, v_h = h, h
+            h = node_attn_layer(q_h, k_h, v_h)
+        # edge embedding are processed by AttentionBlocks
         for edge_attn_layer in self.edge_attn_layers:
-            e_0 = edge_attn_layer(e_0)
+            q_e = e[0, :, :][None, ...].repeat(self.n_neighbors, 1, 1)
+            k_e, v_e = e, e
+            e = edge_attn_layer(q_e, k_e, v_e)
         
-        # cat node&edge features
-        c_0 = self.cat_layer_embed(
-            torch.cat([h_0, e_0], dim=-1)
-        ) 
+        # cat node&edge embedding
+        m = self.cat_layer_embed(
+            torch.cat([h, e], dim=-1)
+        )
         
-        return h_0, c_0
+        return m, h
 
 
 class CollectModel(nn.Module):
@@ -150,8 +135,7 @@ class CollectModel(nn.Module):
         self.ampnns = nn.ModuleList(
             AmpnnBlock(
                 embed_dim = embed_dim,
-                edge_dim = edge_dim,
-                node_dim = node_dim,
+                n_heads = n_heads,
                 n_layers = n_layers,
                 dropout = dropout,
                 n_neighbors = n_neighbors
@@ -174,16 +158,20 @@ class CollectModel(nn.Module):
         edge_feats: Tensor
     ) -> Tuple[Tensor, Tensor]:
         # node features embedding
-        h_0 = self.init_node_embed(node_feats)
+        h = self.init_node_embed(node_feats)
         # edge features embedding
-        e_0 = self.init_edge_embed(edge_feats)
+        e = self.init_edge_embed(edge_feats)
+        
+        x, y = h, e
         for ampnn in self.ampnns:
-            h_0, e_0 = ampnn(h_0, e_0)
+            # y already does not mean edge
+            x, y = ampnn(x, y)
         
-        out = self.attn_layer(e_0)
-        out = self.lm_heads(out.sum(dim=0))
+        y_1 = self.attn_layer(y)
+        y_2 = self.lm_heads(y_1.sum(dim=0))
         
-        return out
+        return y_2
+
 
 class LiteModel(pl.LightningModule):
     def __init__(
@@ -195,6 +183,7 @@ class LiteModel(pl.LightningModule):
         dropout = 0.2,
         n_layers = 6,
         n_tokens = 21,
+        n_heads = 8,
         n_neighbors = 32,
         lr = 1e-3,
     ):
@@ -215,8 +204,9 @@ class LiteModel(pl.LightningModule):
             n_layers = n_layers,
             n_tokens = n_tokens,
             n_neighbors = n_neighbors,
-            n_heads = 8,
+            n_heads = n_heads,
         )
+        
     
     def training_step(self, batch, batch_idx) -> Dict[str, Tensor]:
         node, edge, y = batch
@@ -315,6 +305,7 @@ def main(args):
         dropout = args.dropout,
         n_layers = args.n_layers,
         n_tokens = args.n_tokens,
+        n_heads= args.n_heads,
         n_neighbors = args.n_neighbors,
         lr = args.lr,
     )
@@ -362,6 +353,7 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--n_tokens', type=int, default=21)
+    parser.add_argument('--n_heads', type=float, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--n_neighbors', type=int, default=32)
     parser.add_argument('--train-batch-size', type=int, default=8)
@@ -369,7 +361,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--train_data',
         type=str,
-        help='training data path',
+        help='training data path.default[./data/s669_AF_PDBs.pt]',
         default=os.path.join(os.getcwd(), 'data', 's669_AF_PDBs.pt')
     )
     

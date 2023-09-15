@@ -119,7 +119,7 @@ class CollectModel(nn.Module):
         self,
         embed_dim = 128,
         edge_dim = 27,
-        node_dim = 28,
+        node_dim = 37,
         dropout = 0.2,
         n_layers = 6,
         n_tokens = 21,
@@ -167,7 +167,7 @@ class CollectModel(nn.Module):
             # y already does not mean edge
             x, y, _ = ampnn(x, y)
         
-        y_1 = self.attn_layer(y)
+        y_1 = self.attn_layer(x, y, y)
         y_2 = self.lm_heads(y_1.sum(dim=0))
         
         return y_2
@@ -179,7 +179,7 @@ class LiteModel(pl.LightningModule):
         args,
         embed_dim = 128,
         edge_dim = 27,
-        node_dim = 28,
+        node_dim = 37,
         dropout = 0.2,
         n_layers = 6,
         n_tokens = 21,
@@ -320,7 +320,7 @@ def main(args):
         accelerator = 'gpu',
         devices = 2,
         precision = '16-mixed',
-        max_epochs = 1,
+        max_epochs = 30,
         logger = logger,
         log_every_n_steps = 1,
         enable_model_summary = True,
@@ -347,23 +347,66 @@ def main(args):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--edge_dim', type=int, default=27)
-    parser.add_argument('--node_dim', type=int, default=28)
-    parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--n_layers', type=int, default=6)
-    parser.add_argument('--n_tokens', type=int, default=21)
-    parser.add_argument('--n_heads', type=float, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--n_neighbors', type=int, default=32)
-    parser.add_argument('--train-batch-size', type=int, default=8)
-    parser.add_argument('--valid-batch-size', type=int, default=32)
+    parser.add_argument(
+        '--embed_dim', 
+        type=int,
+        help="Embedding dimension. default[128]",
+        default=128)
+    parser.add_argument(
+        '--edge_dim', 
+        type=int, 
+        help="Edge features dimension. default[27]",
+        default=27)
+    parser.add_argument(
+        '--node_dim', 
+        type=int, 
+        help="Node features dimension. default[37]",
+        default=37)
+    parser.add_argument(
+        '--dropout', 
+        type=float, 
+        help="Dropout. default[0.2]",
+        default=0.2)
+    parser.add_argument(
+        '--n_layers', 
+        type=int, 
+        help="Number of layers. default[6]",
+        default=6)
+    parser.add_argument(
+        '--n_tokens', 
+        type=int, 
+        help="Number of tokens. default[21]",
+        default=21)
+    parser.add_argument(
+        '--n_heads', 
+        type=float, 
+        help="Number of heads. default[8]",
+        default=8)
+    parser.add_argument(
+        '--lr', 
+        type=float, 
+        help="Learning rate. default[1e-4]",
+        default=1e-4)
+    parser.add_argument(
+        '--n_neighbors', 
+        type=int, 
+        help="Number of neighbor residues. default[32]",
+        default=32)
+    parser.add_argument(
+        '--train-batch-size', 
+        type=int, 
+        help="Train batch size. default[4]",
+        default=4)
+    parser.add_argument(
+        '--valid-batch-size', 
+        type=int, 
+        help="Valid batch size. default[8]",
+        default=8)
     parser.add_argument(
         '--train_data',
         type=str,
         help='training data path.default[./data/s669_AF_PDBs.pt]',
-        default=os.path.join(os.getcwd(), 'data', 's669_AF_PDBs.pt')
-    )
+        default=os.path.join(os.getcwd(), 'data', 's669_AF_PDBs.pt'))
     
     args = parser.parse_args()
     

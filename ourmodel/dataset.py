@@ -1,9 +1,9 @@
 import argparse
 import dataclasses
-import glob
+# import glob
 import gzip
 import os
-import pickle
+# import pickle
 import warnings
 from functools import partial
 from typing import List, Optional, Tuple
@@ -19,37 +19,57 @@ from Bio.PDB.Polypeptide import three_to_index
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
+from Bio.PDB.DSSP import DSSP
+from Bio.SeqUtils import seq1
+from config import *
 
 
 @dataclasses.dataclass
 class Proteinbb:
+    # Atoms
     ca: Tensor  # (NUM_RES, 1, 3)
     cb: Tensor  # (NUM_RES, 1, 3)
     c: Tensor  # (NUM_RES, 1, 3)
     n: Tensor  # (NUM_RES, 1, 3)
     o: Tensor  # (NUM_RES, 1, 3)
     
+    # residue & chain
     seq: Tensor  # (NUM_RES, 1)
     resseq: Tensor  # (NUM_RES, 1)
     chain_id: Tensor  # (NUM_RES, 1)
     
-    bb_ang: Tensor  # (NUM_RES, 6)
-    sasa: Tensor  # (NUM_RES, 5)
+    # residue properties
+    dihe_ang: Tensor  # (NUM_RES, 8)
+    charge: Tensor # (NUM_RES, 1)
+    aroma: Tensor # (NUM_RES, 1)
+    hydro: Tensor # (NUM_RES, 1)
+    polar: Tensor # (NUM_RES, 1)
+    size: Tensor # (NUM_RES, 1)
+    rsa: Tensor # (NUM_RES, 1)
+    ss: Tensor # (NUM_RES, 1)
     
     def __post_init__(self):
-        self.ca = self._preprocess(self.ca)
-        self.cb = self._preprocess(self.cb)
-        self.c = self._preprocess(self.c)
-        self.n = self._preprocess(self.n)
-        self.o = self._preprocess(self.o)
+        self.ca = self._preprocess(self.ca, is_atom=True)
+        self.cb = self._preprocess(self.cb, is_atom=True)
+        self.c = self._preprocess(self.c, is_atom=True)
+        self.n = self._preprocess(self.n, is_atom=True)
+        self.o = self._preprocess(self.o, is_atom=True)
         
-        self.seq = self._preprocess(self.seq, is_atom=False)
-        self.resseq = self._preprocess(self.resseq, is_atom=False)
-        self.chain_id = self._preprocess(self.chain_id, is_atom=False)
-        self.bb_ang = self._preprocess(self.bb_ang, is_atom=False)
-        self.sasa = self._preprocess(self.sasa, is_atom=False)
+        self.seq = self._preprocess(self.seq)
+        self.resseq = self._preprocess(self.resseq)
+        self.chain_id = self._preprocess(self.chain_id)
+
+        self.dihe_ang = self._preprocess(self.dihe_ang)
+        self.charge = self._preprocess(self.charge)
+        self.aroma = self._preprocess(self.aroma)
+        self.hydro = self._preprocess(self.hydro)
+        self.polar = self._preprocess(self.polar)
+        self.size = self._preprocess(self.size)
+        self.rsa = self._preprocess(self.rsa)
+        self.ss = self._preprocess(self.ss)
+
     
-    def _preprocess(self, x: List, is_atom: bool = True):
+    def _preprocess(self, x: List, is_atom: bool = False):
         x = Tensor(np.array(x))
         
         return x[:, None, ...] if is_atom else x
@@ -75,9 +95,45 @@ def init_empty_protein(n_res: int = 32):
         resseq = init_others,
         seq = init_others,
         chain_id = init_others,
-        bb_ang = torch.zeros((n_res, 6)),
-        sasa = torch.zeros((n_res, 5))
+        dihe_ang = torch.zeros((n_res, 8)),
+        charge = init_others,
+        aroma = init_others,
+        hydro = init_others,
+        polar = init_others,
+        size = init_others,
+        rsa = init_others,
+        ss = init_others,
     )
+
+
+def get_rsa_ss(model, pdb_file, aads):
+    """get RAS(relative solvent accessibility) and secondary structure from structure
+    Args:
+        model (Structure): structure object
+        pdb_file (str): path of pdb file
+        aads (list): amino acids of structure
+    Returns:
+        ras_list (list): three-state RAS. 0->Buried, 1->Intermediate, 2->Exposed
+        ss_list (list): secondary structure index, 0-> helix, 1-sheet, 2->other
+    """
+    offset = 0
+    ras_list, ss_list = [], []
+    dssp = DSSP(model, pdb_file, dssp='mkdssp')
+    for i, d in enumerate(dssp):
+        _, aad, ss, rsa = d[:4]
+        # three-state RSA
+        state = rsa_to_three_state(rsa)
+        # secondary structure index
+        ss_index = ss_to_index.get(ss, 2)
+        while aad != aads[i+offset]:
+            # absence or abnormality of residues
+            ras_list.append([0])
+            ss_list.append([2])
+            offset += 1
+        ras_list.append([state])
+        ss_list.append([ss_index])
+    assert len(ras_list) == len(ss_list)
+    return ras_list, ss_list
 
 
 def read_pdb(pdb_file: str):
@@ -134,11 +190,13 @@ def calculator(pdb_file: str):
     resseq_list, seq_list = [], []
     # list of chain identity
     chain_id_list = []
-    # backbone dihedral angle
-    bb_ang_list = []
-    # solvent accessible surface area
-    sasa_list = []
+    # dihedral angle
+    ang_list = []
+    # properties of residue
+    charge_list, aroma_list, hydro_list, polar_list, size_list = [], [], [], [], []
     
+    one_letters = []
+
     structure = read_pdb(pdb_file)
     if structure:
         structure.atom_to_internal_coordinates()
@@ -148,11 +206,24 @@ def calculator(pdb_file: str):
         
         for chain in structure.get_chains():
             if chain.id not in chain_dict:
+                # chain name to chain index
                 chain_dict[chain.id] = len(chain_dict)
             # structure chain index
             chain_id = chain_dict[chain.id]
             
             for residue in chain.get_residues():
+                res_name = residue.get_resname()
+                res_charge = residue_to_charge.get(res_name, 0)
+                res_aroma = residue_to_aromatic.get(res_name, 0)
+                res_hydro = residue_to_hydrophobic.get(res_name, 0)
+                res_polar = residue_to_polarity.get(res_name, 0)
+                res_size = residue_to_size.get(res_name, 0)
+                charge_list.append([res_charge])
+                aroma_list.append([res_aroma])
+                hydro_list.append([res_hydro])
+                polar_list.append([res_polar])
+                size_list.append([res_size])
+                one_letters.append(seq1(res_name))
                 # determine the integrity of the backbone atoms
                 isBBcomplete = all(atom in residue for atom in heavy_atoms)
                 # residue.id[0] == ' ' mean "Classical residue"
@@ -192,20 +263,30 @@ def calculator(pdb_file: str):
                         token_id = 20
                     seq_list.append([token_id])
                     
-                    # Get the backbone dihedral angle
+                    # Get the dihedral angle
                     ric = residue.internal_coord
                     phi = ric.get_angle('phi')
                     psi = ric.get_angle('psi')
                     omg = ric.get_angle('omg')
+                    chi1 = ric.get_angle('chi1')
                     
                     phi = 0 if phi == None else phi
                     psi = 0 if psi == None else psi
                     omg = 0 if omg == None else omg
+                    chi1 = 0 if chi1 == None else chi1
                     
-                    bb_ang_list.append(np.concatenate([
-                        np.sin(np.deg2rad([phi, psi, omg])),
-                        np.cos(np.deg2rad([phi, psi, omg])),
+                    ang_list.append(np.concatenate([
+                        np.sin(np.deg2rad([phi, psi, omg, chi1])),
+                        np.cos(np.deg2rad([phi, psi, omg, chi1])),
                     ]))
+        # get three-state RSA, and secondary structure index
+        rsa_list, ss_list = get_rsa_ss(structure, pdb_file, one_letters)
+        assert len(rsa_list) == len(ca_list)
+    else:
+        warnings.warn(
+                    message=f"Failed to calculate structure {pdb_file}.",
+                    category=None,
+        )
     
     return Proteinbb(
         ca = ca_list, 
@@ -216,8 +297,14 @@ def calculator(pdb_file: str):
         seq = seq_list, 
         resseq = resseq_list, 
         chain_id = chain_id_list, 
-        bb_ang = bb_ang_list, 
-        sasa = sasa_list,
+        dihe_ang = ang_list, 
+        charge = charge_list,
+        aroma = aroma_list,
+        hydro = hydro_list,
+        polar = polar_list,
+        size = size_list,
+        rsa = rsa_list,
+        ss = ss_list,
     )
                 
 
@@ -250,7 +337,14 @@ def get_neighbors(
         init_prot.seq[:n_res, :] = protbb.seq
         init_prot.resseq[:n_res, :] = protbb.resseq
         init_prot.chain_id[:n_res, :] = protbb.chain_id
-        init_prot.bb_ang[:n_res, :] = protbb.bb_ang
+        init_prot.dihe_ang[:n_res, :] = protbb.dihe_ang
+        init_prot.charge[:n_res, :] = protbb.charge
+        init_prot.aroma[:n_res, :] = protbb.aroma
+        init_prot.hydro[:n_res, :] = protbb.hydro
+        init_prot.polar[:n_res, :] = protbb.polar
+        init_prot.size[:n_res, :] = protbb.size
+        init_prot.rsa[:n_res, :] = protbb.rsa
+        init_prot.ss[:n_res, :] = protbb.ss
         
         protbb = init_prot
         n_res = n_neighbors
@@ -258,6 +352,8 @@ def get_neighbors(
     assert len(protbb.ca) == len(protbb.resseq)
     assert len(protbb.resseq) == len(protbb.seq)
     assert len(protbb.seq) == len(protbb.chain_id)
+    assert len(protbb.chain_id) == len(protbb.charge)
+    assert len(protbb.charge) == len(protbb.rsa)
     
     # Backbone CA atomic interatomic distance
     # ca_dist = torch.sqrt(torch.sum(
@@ -276,28 +372,10 @@ def get_neighbors(
         input=ca_dist, 
         k=n_neighbors, 
         largest=False
-    )
-    rel_pos = torch.clamp(
-        input=(protbb.resseq.T - protbb.resseq), 
-        min=-32, 
-        max=32
-    )  # (NUM_RES, NUM_RES)
-    # (NUM_RES, NUM_RES)
-    rel_chains = (protbb.chain_id.T - protbb.chain_id).bool()
-    rel_chains = (~rel_chains).int() # (NUM_RES, NUM_RES)
+    ) # (NUM_RES, NUM_NEIGHBOR)
     
-    # 在蛋白序列上相对于中心残基的偏移量
-    pos = torch.gather(
-        input=rel_pos, 
-        dim=1, 
-        index=indices
-    )  # (NUM_RES, NUM_NEIGHBORS)
-    # chain identity
-    chain_id = torch.gather(
-        input=rel_chains, 
-        dim=1, 
-        index=indices
-    )  # (NUM_RES, NUM_NEIGHBORS)
+    ### node features ###
+
     # amino acid type torken
     seq_tokens = torch.gather(
         input=protbb.seq.T.repeat(n_res, 1),
@@ -314,11 +392,57 @@ def get_neighbors(
         # mask all for inference
         seq_tokens[:, 0] = 21
     
-    bb_ang = torch.gather(
-        input=protbb.bb_ang[:, None, ...].repeat(1, n_res, 1),
+    # 这里的维度扩张似乎没有意义，只是为了确保shape上的统一
+    dihe_ang = torch.gather(
+        input=protbb.dihe_ang[:, None, ...].repeat(1, n_res, 1),
         dim=1,
-        index=indices[..., None].repeat(1, 1, 6),
-    )  # (NUM_RES, NUM_NEIGHBORS, 6)
+        index=indices[..., None].repeat(1, 1, 8),
+    )  # (NUM_RES, NUM_NEIGHBORS, 8)
+    # residue charge propertie
+    charges = torch.gather(
+        input=protbb.charge.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue aromatic propertie
+    aromas = torch.gather(
+        input=protbb.aroma.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue hydrophobicity propertie
+    hydros = torch.gather(
+        input=protbb.hydro.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue polarity propertie
+    polars = torch.gather(
+        input=protbb.polar.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue size propertie
+    sizes = torch.gather(
+        input=protbb.size.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue RSA(relative solvent accessibility)
+    rsas = torch.gather(
+        input=protbb.rsa.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    # residue secondary structure
+    sss = torch.gather(
+        input=protbb.ss.repeat(1, n_res),
+        dim=1,
+        index=indices,
+    )[..., None] # (NUM_RES, NUM_NEIGHBORS, 1)
+    
+    ### edge features ###
+
     bb_coords = torch.cat(
         tensors=[protbb.ca, protbb.cb, protbb.c, protbb.n, protbb.o],
         dim = -2
@@ -331,17 +455,45 @@ def get_neighbors(
     dist_x = bb_coords[None, :, None, ...] - bb_coords[:, None, :, None, ...]  # (NUM_RES, NUM_RES, 5, 5, 3)
     dist = torch.sqrt(torch.sum(dist_x ** 2, dim=-1)).reshape(n_res, n_res, 25)  # (NUM_RES, NUM_RES, 5, 5) -> (NUM_RES, NUM_RES, 25)
     dist = torch.gather(dist, dim=1, index=indices[..., None].repeat(1, 1, 25))  # (NUM_RES, NUM_NEIGHBORS, 25)
+    dist = torch.clamp(dist, min=0, max=15)
     
+    rel_pos = torch.clamp(
+        input=(protbb.resseq.T - protbb.resseq), 
+        min=-32, 
+        max=32
+    )  # (NUM_RES, NUM_RES)
+    rel_chains = (protbb.chain_id.T - protbb.chain_id).bool()
+    rel_chains = (~rel_chains).int() # (NUM_RES, NUM_RES)
+    # 在蛋白序列上相对于中心残基的偏移量
+    pos = torch.gather(
+        input=rel_pos, 
+        dim=1, 
+        index=indices
+    )  # (NUM_RES, NUM_NEIGHBORS)
+    # chain identity
+    chain_id = torch.gather(
+        input=rel_chains, 
+        dim=1, 
+        index=indices
+    )  # (NUM_RES, NUM_NEIGHBORS)
+    
+    ### cat features ###
+
     nodes = torch.cat(
-        tensors=[F.one_hot(seq_tokens.long(), num_classes=22), bb_ang], 
+        tensors=[
+            F.one_hot(seq_tokens.long(), num_classes=22), # amino acid type
+            dihe_ang, # dihedral angle
+            charges, aromas, hydros, polars, sizes, rsas, sss, # properties
+            ], 
         dim = -1
-    ).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 22 + 6)
-    edge = torch.cat(
-        tensors=[dist, pos[..., None], chain_id[..., None],], 
+    ).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 22 + 8 + 7)
+    edges = torch.cat(
+        tensors=[dist, pos[..., None], chain_id[..., None],],
         dim = -1
     ).transpose(1, 0)  # (NUM_RES, NUM_NEIGHBORS, 25 + 1 + 1)
-    
-    return nodes, edge, protbb.seq.squeeze(-1).long()
+    targets = protbb.seq.squeeze(-1).long()
+
+    return nodes, edges, targets
 
 
 def parallel_converter(pdb: str) -> Proteinbb:
@@ -384,7 +536,6 @@ def collat_fn(batch):
 class ProteinDataset(Dataset):
     def __init__(
         self,
-        # data: List[List[Tensor, Tensor, torch.LongTensor]],
         protbbs: List[Proteinbb],
         noise = 0.0,
         n_neighbors = 32,
@@ -394,8 +545,6 @@ class ProteinDataset(Dataset):
         self.protbbs = protbbs
         self.noise = noise
         self.n_neighbors = n_neighbors
-        
-        # self.data = data
         
     def __getitem__(self, idx) -> Tuple[Tensor, Tensor, torch.LongTensor]:
         protbb = self.protbbs[idx]
@@ -490,7 +639,6 @@ if __name__ == '__main__':
     )
     
     args = parser.parse_args()
-    
     
     pdb_filenames = os.listdir(args.input_dir)
     pdb_filenames = [os.path.join(args.input_dir, f) for f in pdb_filenames]
